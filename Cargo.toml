@@ -29,10 +29,12 @@ default = []
 semi-naive = ["mork/semi_naive_ic"]          # metta_calculus fixpoints match only the delta per round
 leapfrog = ["mork/leapfrog"]                 # flat conjunctive exec bodies route to the WCO leapfrog join
 factorized-aggregate = ["mork/factorized_aggregate"] # COUNT/SUM/MIN/MAX/AND exec sinks without enumerating the join
-guarded-emit = ["mork/guarded_emit"]        # guarded emit sinks report consulted and dropped candidate counts
-retrieval-join = ["mork/retrieval_join"]
-bulk-emit = ["mork/bulk_emit"]
-witness-select = ["mork/witness_select"]   # small schema-table join factors apply per tuple by unifiability retrieval
+# guarded-emit, retrieval-join, bulk-emit, and
+# witness-select need the fork's metta-on-mork-base branch until their PRs land.
+# guarded-emit = ["mork/guarded_emit"]        # guarded emit sinks report consulted and dropped candidate counts
+# retrieval-join = ["mork/retrieval_join"]
+# bulk-emit = ["mork/bulk_emit"]
+# witness-select = ["mork/witness_select"]   # small schema-table join factors apply per tuple by unifiability retrieval
 
 [[example]]
 name = "factorized_count"
@@ -45,3 +47,6 @@ required-features = ["semi-naive"]
 [[example]]
 name = "process_calculus_step"
 required-features = ["semi-naive"]
+
+[[example]]
+name = "f1_workload"
