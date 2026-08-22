@@ -505,6 +505,41 @@ impl MorkSpace {
         )
     }
 
+    /// Diagnostic spike: raw callback count without any decode or materialization.
+    /// Returns the number of kernel callbacks (each result the kernel matched).
+    pub fn query_count_raw(&self, query: &Atom) -> usize {
+        if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
+            return 1;
+        }
+        let Some(pattern) = wrap_pattern(query) else {
+            return 0;
+        };
+        query_btm_rows_count_raw(&self.kernel.btm, &pattern.bytes)
+    }
+
+    /// Diagnostic spike: decoded callback count without Vec accumulation.
+    /// Decodes each binding inline and drops it. Returns
+    /// (total_callbacks, decode_ok, decode_errors).
+    pub fn query_count_decoded(&self, query: &Atom) -> (usize, usize, usize) {
+        if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
+            return (1, 1, 0);
+        }
+        let Some(pattern) = wrap_pattern(query) else {
+            return (0, 0, 0);
+        };
+        let mut reg = self.grounded.clone();
+        reg.register(query);
+        query_btm_rows_count_decoded(
+            &self.kernel.btm,
+            &pattern.bytes,
+            &pattern.vars,
+            &pattern.refs,
+            &reg,
+            &pattern.evaluated,
+            conjuncts(query).is_none().then_some(query),
+        )
+    }
+
     /// Incrementally maintains the fresh column indexes across one mutation:
     /// each cached index of the mutated fact's relation absorbs the fact as
     /// one O(1) permuted-key insert or remove, instead of being invalidated
@@ -1217,6 +1252,145 @@ fn query_btm_rows(btm: &PathMap<()>, wrapped: &[u8]) -> Vec<RawRow> {
     rows
 }
 
+/// Diagnostic spike: counts kernel callbacks without any materialization.
+/// No Vec, no sort, no decode — just counting how many times the kernel fires.
+/// Callback always returns true to force full enumeration.
+fn query_btm_rows_count_raw(btm: &PathMap<()>, wrapped: &[u8]) -> usize {
+    let pat_expr = Expr {
+        ptr: wrapped.as_ptr() as *mut u8,
+    };
+    let mut count = 0usize;
+    MorkKernel::query_multi(btm, pat_expr, |_res, _loc| {
+        count += 1;
+        true
+    });
+    count
+}
+
+/// Shared decode-and-visit core: runs `query_multi` on the kernel, decodes each
+/// matched binding, and calls `sink` for every successfully narrowed result.
+/// Returns (total_callbacks, sink_calls, errors).
+fn decode_and_visit(
+    btm: &PathMap<()>,
+    wrapped: &[u8],
+    vars: &[VariableAtom],
+    refs: &[(usize, Atom)],
+    reg: &GroundedRegistry,
+    query_evaluated: &EvaluatedSpans,
+    source_query: Option<&Atom>,
+    mut sink: impl FnMut(Bindings) -> bool,
+) -> (usize, usize, usize) {
+    let pat_expr = Expr {
+        ptr: wrapped.as_ptr() as *mut u8,
+    };
+    let mut total_callbacks = 0usize;
+    let mut sink_calls = 0usize;
+    let mut errors = 0usize;
+    let result_vars = result_var_set(vars, refs);
+    MorkKernel::query_multi(btm, pat_expr, |res, loc| {
+        total_callbacks += 1;
+        let Err(bindings) = res else { return true };
+        let loc_span = unsafe { loc.span().as_ref() };
+        // Fast path: single-factor fact span narrowing
+        let fact_needs_narrowing = loc_span.is_some_and(|f| !span_is_ground(f));
+        if let (Some(query), Some(fact), true) = (source_query, loc_span, fact_needs_narrowing) {
+            let mut pos = 0usize;
+            let mut ctx = DecodeCtx {
+                var_counter: 0,
+                grounded: Some(reg),
+                ns: 1,
+                query_vars: vars,
+                evaluated: None,
+                result_id: next_variable_id(),
+            };
+            if let Some(fact_atom) = decode_atom(fact, &mut pos, &mut ctx) {
+                let mut matched = false;
+                for b in match_atoms(&fact_atom, query)
+                    .into_iter()
+                    .map(|b| b.narrow_vars(&result_vars))
+                {
+                    matched = true;
+                    sink_calls += 1;
+                    if !sink(b) {
+                        return false;
+                    }
+                }
+                if !matched {
+                    errors += 1;
+                }
+                return true;
+            }
+        }
+        // General path: decode entries from bindings map
+        let mut acc = BindingsSet::single();
+        let result_id = next_variable_id();
+        for (&(key_ns, key_idx), env) in bindings.iter() {
+            let mut pos = 0usize;
+            let mut ctx = DecodeCtx {
+                var_counter: env.v as usize,
+                grounded: Some(reg),
+                ns: env.n,
+                query_vars: vars,
+                evaluated: (env.n == 0).then_some(query_evaluated),
+                result_id,
+            };
+            let Some(atom) = decode_atom(
+                unsafe { env.subsexpr().span().as_ref().unwrap() },
+                &mut pos,
+                &mut ctx,
+            ) else {
+                continue;
+            };
+            let var = if key_ns == 0 {
+                match vars.get(key_idx as usize) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                }
+            } else {
+                VariableAtom::new_id(format!("v{}_{}", key_ns, key_idx), result_id)
+            };
+            acc = bind_or_equate(acc, var, atom);
+            if acc.is_empty() {
+                break;
+            }
+        }
+        let needs_narrowing = bindings
+            .iter()
+            .any(|(k, env)| k.0 != 0 || !span_is_ground(unsafe { env.subsexpr().span().as_ref().unwrap() }));
+        let narrowed = apply_live_refs(acc, refs, vars)
+            .into_iter()
+            .map(|b| b.narrow_vars(&result_vars));
+        let mut matched = false;
+        for b in narrowed {
+            matched = true;
+            sink_calls += 1;
+            if !sink(b) {
+                return false;
+            }
+        }
+        if !matched {
+            errors += 1;
+        }
+        true
+    });
+    (total_callbacks, sink_calls, errors)
+}
+
+/// Diagnostic spike: counts kernel callbacks and decodes each binding inline,
+/// then drops it immediately. No Vec accumulation, no sort, no BindingsSet return.
+/// Returns (total_callbacks, decode_ok, decode_errors).
+fn query_btm_rows_count_decoded(
+    btm: &PathMap<()>,
+    wrapped: &[u8],
+    vars: &[VariableAtom],
+    refs: &[(usize, Atom)],
+    reg: &GroundedRegistry,
+    query_evaluated: &EvaluatedSpans,
+    source_query: Option<&Atom>,
+) -> (usize, usize, usize) {
+    decode_and_visit(btm, wrapped, vars, refs, reg, query_evaluated, source_query, |_| true)
+}
+
 /// Decodes raw matcher rows into the caller's `BindingsSet`.
 ///
 /// Single-factor rows carry the matched fact span. Re-decode that fact, run it
@@ -1887,6 +2061,36 @@ impl Space for MorkSpace {
 
     fn query(&self, query: &Atom) -> BindingsSet {
         self.query_inner(query)
+    }
+
+    fn visit_query(
+        &self,
+        query: &Atom,
+        callback: &mut dyn FnMut(Bindings) -> bool,
+    ) -> usize {
+        if conjuncts(query).is_some_and(|qs| qs.is_empty()) {
+            return 0;
+        }
+        let Some(pattern) = wrap_pattern(query) else {
+            return 0;
+        };
+        let mut reg = self.grounded.clone();
+        reg.register(query);
+        let mut count = 0usize;
+        decode_and_visit(
+            &self.kernel.btm,
+            &pattern.bytes,
+            &pattern.vars,
+            &pattern.refs,
+            &reg,
+            &pattern.evaluated,
+            conjuncts(query).is_none().then_some(query),
+            |b| {
+                count += 1;
+                callback(b)
+            },
+        );
+        count
     }
 
     fn atom_count(&self) -> Option<usize> {
@@ -3460,5 +3664,78 @@ mod tests {
 
             prop_assert_eq!(routed, reference);
         }
+    }
+
+    // ===== Phase 1: visit_query tests =====
+
+    /// Compatibility: visit_query count matches query().len() for small dataset.
+    #[test]
+    fn visit_query_count_matches_query_len() {
+        let mut space = MorkSpace::new();
+        for i in 0..100u32 {
+            space.add(Atom::expr([Atom::sym("edge"), Atom::sym(format!("n{i}")), Atom::sym(format!("n{}", i + 1))]));
+        }
+        let query = Atom::expr([Atom::sym("edge"), Atom::var("from"), Atom::var("to")]);
+        let query_len = space.query(&query).len();
+        let visit_count = space.visit_query(&query, &mut |_| true);
+        assert_eq!(query_len, visit_count);
+    }
+
+    /// Early termination: stop after 10 results, verify exactly 10 delivered.
+    #[test]
+    fn visit_query_early_stop() {
+        let mut space = MorkSpace::new();
+        for i in 0..1000u32 {
+            space.add(Atom::expr([Atom::sym("edge"), Atom::sym(format!("n{i}")), Atom::sym(format!("n{}", i + 1))]));
+        }
+        let query = Atom::expr([Atom::sym("edge"), Atom::var("from"), Atom::var("to")]);
+        let mut delivered = 0u32;
+        let count = space.visit_query(&query, &mut |_| {
+            delivered += 1;
+            delivered < 10
+        });
+        assert_eq!(count, 10);
+        assert_eq!(delivered, 10);
+    }
+
+    /// Streaming: large dataset, visit_query returns correct count, no panic.
+    #[test]
+    fn visit_query_large_dataset() {
+        let mut space = MorkSpace::new();
+        for i in 0..50_000u32 {
+            space.add(Atom::expr([Atom::sym("fact"), Atom::sym(format!("item{i}"))]));
+        }
+        let query = Atom::expr([Atom::sym("fact"), Atom::var("x")]);
+        let query_len = space.query(&query).len();
+        let visit_count = space.visit_query(&query, &mut |_| true);
+        assert_eq!(query_len, 50_000);
+        assert_eq!(visit_count, 50_000);
+    }
+
+    /// Empty result set: visit_query returns 0.
+    #[test]
+    fn visit_query_empty() {
+        let space = MorkSpace::new();
+        let query = Atom::expr([Atom::sym("nope"), Atom::var("x")]);
+        let count = space.visit_query(&query, &mut |_| true);
+        assert_eq!(count, 0);
+    }
+
+    /// All bindings are valid: no panics, all bindings contain expected variables.
+    #[test]
+    fn visit_query_bindings_valid() {
+        let mut space = MorkSpace::new();
+        space.add(Atom::expr([Atom::sym("knows"), Atom::sym("Alice"), Atom::sym("Bob")]));
+        space.add(Atom::expr([Atom::sym("knows"), Atom::sym("Alice"), Atom::sym("Charlie")]));
+        let query = Atom::expr([Atom::sym("knows"), Atom::sym("Alice"), Atom::var("who")]);
+        let mut names = Vec::new();
+        space.visit_query(&query, &mut |b| {
+            if let Some(val) = b.resolve(&VariableAtom::new("who")) {
+                names.push(val.to_string());
+            }
+            true
+        });
+        names.sort();
+        assert_eq!(names, vec!["Bob", "Charlie"]);
     }
 }
